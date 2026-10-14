@@ -2,16 +2,20 @@
 
 /**
  * Run the actual TypeScript API handler in-process against controlled NextAuth
- * and NextResponse adapters. Zod and TypeScript come from the locked project
- * dependencies; no HTTP server, user database, or remote publishing is used.
+ * and a controlled NextAuth adapter. NextRequest, NextResponse, Zod and
+ * TypeScript come from the project's locked dependencies. An isolated loopback
+ * HTTP bridge exercises response status/JSON without any user database or
+ * third-party publishing.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const http = require('node:http');
 const ts = require('typescript');
 const { z } = require('zod');
+const { NextRequest, NextResponse } = require('next/server');
 
 const SOURCE = process.env.PUBLISH_ROUTE_SOURCE
   || path.resolve(__dirname, '../../src/app/api/publish/route.ts');
@@ -35,18 +39,7 @@ function loadPost(session) {
   const module = { exports: {} };
   let networkCalls = 0;
   const fakeRequire = (id) => {
-    if (id === 'next/server') {
-      return {
-        NextResponse: {
-          json(data, opts = {}) {
-            return new Response(JSON.stringify(data), {
-              status: opts.status ?? 200,
-              headers: { 'Content-Type': 'application/json' },
-            });
-          },
-        },
-      };
-    }
+    if (id === 'next/server') return { NextRequest, NextResponse };
     if (id === 'next-auth') {
       return { getServerSession: async () => session };
     }
@@ -93,7 +86,12 @@ function payload(platform, platformConfig = undefined) {
 }
 
 async function invoke(post, body) {
-  const response = await post({ json: async () => body });
+  const request = new NextRequest('http://127.0.0.1:3000/api/publish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const response = await post(request);
   assert.equal(response instanceof Response, true);
   return { status: response.status, data: await response.json() };
 }
@@ -153,4 +151,43 @@ test('zsxq missing group configuration is still an unimplemented API operation',
   assert.equal(response.status, 501);
   assert.equal(response.data.success, false);
   assert.equal(networkCalls(), 0);
+});
+
+test('isolated loopback HTTP request reflects truthful publishing status', async () => {
+  const { post, networkCalls } = loadPost(authorized);
+  const server = http.createServer(async (incoming, outgoing) => {
+    try {
+      const chunks = [];
+      for await (const chunk of incoming) chunks.push(chunk);
+      const request = new NextRequest('http://127.0.0.1/api/publish', {
+        method: incoming.method,
+        headers: incoming.headers,
+        body: Buffer.concat(chunks),
+      });
+      const result = await post(request);
+      outgoing.writeHead(result.status, Object.fromEntries(result.headers));
+      outgoing.end(await result.text());
+    } catch (error) {
+      outgoing.writeHead(599, { 'Content-Type': 'application/json' });
+      outgoing.end(JSON.stringify({ harnessError: String(error) }));
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    const response = await fetch('http://127.0.0.1:' + address.port + '/api/publish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload('wechat')),
+    });
+    assert.equal(response.status, 501);
+    const data = await response.json();
+    assert.equal(data.success, false);
+    assert.ok(data.error);
+    assert.equal(networkCalls(), 0);
+  } finally {
+    await new Promise((resolve, reject) =>
+      server.close((error) => error ? reject(error) : resolve())
+    );
+  }
 });

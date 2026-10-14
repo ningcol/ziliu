@@ -1,0 +1,66 @@
+name: Publish API contract
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/publish-api-contract.yml'
+      - 'src/app/api/publish/route.ts'
+      - 'scripts/tests/publish-api-contract.test.cjs'
+      - 'package.json'
+      - 'package-lock.json'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish-api-contract.yml'
+      - 'src/app/api/publish/route.ts'
+      - 'scripts/tests/publish-api-contract.test.cjs'
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Assert baseline RED is the precise false-success regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show 61af579266848ee50d12a0b658d1e32a49dabfde:src/app/api/publish/route.ts > "$RUNNER_TEMP/publish-base-route.ts"
+          set +e
+          PUBLISH_ROUTE_SOURCE="$RUNNER_TEMP/publish-base-route.ts" node --test --test-reporter=tap scripts/tests/publish-api-contract.test.cjs > "$RUNNER_TEMP/publish-red.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/publish-red.log"
+          if [ "$rc" -eq 0 ]; then
+            echo "Expected baseline false-success tests to fail, but they passed"
+            exit 1
+          fi
+          for platform in wechat zhihu juejin zsxq; do
+            grep -q "not ok.*unimplemented $platform never falsely reports published" "$RUNNER_TEMP/publish-red.log" || {
+              echo "Expected RED test failure for $platform not observed"
+              exit 1
+            }
+          done
+          echo "RED proven: all four source placeholders violated truthful success semantics"
+      - name: Validate modified handler GREEN
+        run: node --test scripts/tests/publish-api-contract.test.cjs
+      - name: TypeScript validation
+        run: npx tsc --noEmit
+      - name: Production build smoke (no production credentials)
+        env:
+          NEXTAUTH_URL: http://127.0.0.1:3000
+          NEXTAUTH_SECRET: test-only-publish-contract-secret-is-not-for-production
+          DATABASE_URL: file:./publish-contract-ci.db
+        run: npm run build
